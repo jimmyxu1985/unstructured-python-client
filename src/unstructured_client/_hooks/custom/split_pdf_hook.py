@@ -6,6 +6,7 @@ import logging
 import os
 import math
 import uuid
+from asyncio import AbstractEventLoop
 from collections.abc import Awaitable
 from typing import Any, Coroutine, Optional, Tuple, Union, cast
 
@@ -51,12 +52,12 @@ async def _order_keeper(index: int, coro: Awaitable) -> Tuple[int, httpx.Respons
     return index, response
 
 
-async def run_tasks(coroutines: list[Coroutine], allow_failed: bool = False) -> list[tuple[int, httpx.Response]]:
+async def run_tasks(loop: AbstractEventLoop, coroutines: list[Coroutine], allow_failed: bool = False) -> list[tuple[int, httpx.Response]]:
     if allow_failed:
         responses = await asyncio.gather(*coroutines, return_exceptions=False)
         return list(enumerate(responses, 1))
     # TODO: replace with asyncio.TaskGroup for python >3.11 # pylint: disable=fixme
-    tasks = [asyncio.create_task(_order_keeper(index, coro)) for index, coro in enumerate(coroutines, 1)]
+    tasks = [loop.create_task(_order_keeper(index, coro)) for index, coro in enumerate(coroutines, 1)]
     results = []
     remaining_tasks = dict(enumerate(tasks, 1))
     for future in asyncio.as_completed(tasks):
@@ -369,7 +370,7 @@ class SplitPdfHook(SDKInitHook, BeforeRequestHook, AfterSuccessHook, AfterErrorH
 
         ioloop = asyncio.get_event_loop()
         task_responses: list[tuple[int, httpx.Response]] = ioloop.run_until_complete(
-            run_tasks(tasks, allow_failed=self.allow_failed)
+            run_tasks(ioloop, tasks, allow_failed=self.allow_failed)
         )
 
         if task_responses is None:
