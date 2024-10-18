@@ -55,23 +55,21 @@ async def run_tasks(coroutines: list[Coroutine], allow_failed: bool = False) -> 
     if allow_failed:
         responses = await asyncio.gather(*coroutines, return_exceptions=False)
         return list(enumerate(responses, 1))
-    # TODO: replace with asyncio.TaskGroup for python >3.11 # pylint: disable=fixme
+
     tasks = [asyncio.create_task(_order_keeper(index, coro)) for index, coro in enumerate(coroutines, 1)]
-    results = []
-    remaining_tasks = dict(enumerate(tasks, 1))
-    for future in asyncio.as_completed(tasks):
-        index, response = await future
-        if response.status_code != 200:
-            # cancel all remaining tasks
-            for remaining_task in remaining_tasks.values():
-                remaining_task.cancel()
-            results.append((index, response))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    final_results = []
+    for result in results:
+        if isinstance(result, Exception):
+            # Cancel all remaining tasks
+            for task in tasks:
+                task.cancel()
             break
-        results.append((index, response))
-        # remove task from remaining_tasks that should be cancelled in case of failure
-        del remaining_tasks[index]
-    # return results in the original order
-    return sorted(results, key=lambda x: x[0])
+        final_results.append(result)
+
+    # Return results in the original order
+    return sorted(final_results, key=lambda x: x[0])
 
 
 def context_is_uvloop():
@@ -296,7 +294,7 @@ class SplitPdfHook(SDKInitHook, BeforeRequestHook, AfterSuccessHook, AfterErrorH
             logger.info(
                 "Partitioning 1 file with %d page(s).",
                 page_count % split_size,
-            )
+                )
 
         # Use a variable to adjust the httpx client timeout, or default to 30 minutes
         # When we're able to reuse the SDK to make these calls, we can remove this var
@@ -350,27 +348,12 @@ class SplitPdfHook(SDKInitHook, BeforeRequestHook, AfterSuccessHook, AfterErrorH
             headers={"operation_id": operation_id},
         )
 
-    def _await_elements(
-            self, operation_id: str) -> Optional[list]:
-        """
-        Waits for the partition requests to complete and returns the flattened
-        elements.
-
-        Args:
-            operation_id (str): The ID of the operation.
-
-        Returns:
-            Optional[list]: The flattened elements if the partition requests are
-            completed, otherwise None.
-        """
+    async def _await_elements_async(self, operation_id: str) -> Optional[list]:
         tasks = self.coroutines_to_execute.get(operation_id)
         if tasks is None:
             return None
 
-        ioloop = asyncio.get_event_loop()
-        task_responses: list[tuple[int, httpx.Response]] = ioloop.run_until_complete(
-            run_tasks(tasks, allow_failed=self.allow_failed)
-        )
+        task_responses: list[tuple[int, httpx.Response]] = await run_tasks(tasks, allow_failed=self.allow_failed)
 
         if task_responses is None:
             return None
@@ -415,30 +398,33 @@ class SplitPdfHook(SDKInitHook, BeforeRequestHook, AfterSuccessHook, AfterErrorH
         Returns:
             Union[httpx.Response, Exception]: If requests were run in parallel, a
             combined response object; otherwise, the original response. Can return
-            exception if it ocurred during the execution.
+            exception if it occurred during the execution.
         """
         # Grab the correct id out of the dummy request
         operation_id = response.request.headers.get("operation_id")
 
-        elements = self._await_elements(operation_id)
+        async def run():
+            elements = await self._await_elements_async(operation_id)
 
-        # if fails are disallowed, return the first failed response
-        # Note(austin): Stick a 500 status code in here so the SDK
-        # does not trigger its own retry logic
-        if not self.allow_failed and self.api_failed_responses.get(operation_id):
-            failure_response = self.api_failed_responses[operation_id][0]
-            failure_response.status_code = 500
+            # if fails are disallowed, return the first failed response
+            # Note: Stick a 500 status code in here so the SDK
+            # does not trigger its own retry logic
+            if not self.allow_failed and self.api_failed_responses.get(operation_id):
+                failure_response = self.api_failed_responses[operation_id][0]
+                failure_response.status_code = 500
 
+                self._clear_operation(operation_id)
+                return failure_response
+
+            if elements is None:
+                return response
+
+            new_response = request_utils.create_response(elements)
             self._clear_operation(operation_id)
-            return failure_response
 
-        if elements is None:
-            return response
+            return new_response
 
-        new_response = request_utils.create_response(elements)
-        self._clear_operation(operation_id)
-
-        return new_response
+        return asyncio.run(run())
 
     def after_error(
             self,

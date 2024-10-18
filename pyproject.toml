@@ -3,7 +3,6 @@ name = "unstructured-client"
 version = "0.26.0"
 description = "Python Client SDK for Unstructured API"
 authors = ["Unstructured",]
-readme = "README-PYPI.md"
 repository = "https://github.com/Unstructured-IO/unstructured-python-client.git"
 license = "MIT"
 packages = [
